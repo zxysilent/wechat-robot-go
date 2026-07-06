@@ -208,10 +208,13 @@ func TestPoller_EmptyResponse(t *testing.T) {
 }
 
 func TestPoller_OnlyUserMessages(t *testing.T) {
+	var mu sync.Mutex
 	var handledTypes []MessageType
 
 	handler := func(ctx context.Context, msg *Message) error {
+		mu.Lock()
 		handledTypes = append(handledTypes, msg.MessageType)
+		mu.Unlock()
 		return nil
 	}
 
