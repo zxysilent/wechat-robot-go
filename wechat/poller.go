@@ -141,10 +141,14 @@ func (p *Poller) Run(ctx context.Context) error {
 			httpTimeout = newTimeout
 		}
 
-		// Process messages FIRST - only handle user messages (message_type == 1)
+		// Process messages - only handle user messages (message_type == 1)
 		// Use internalCtx so that message processing isn't interrupted by external ctx cancellation
+		// Each message is processed in a goroutine to allow concurrent message processing.
+		// This is important for scenarios where the handler blocks (e.g., waiting for agent response)
+		// so subsequent messages can still be processed.
 		processedCount := 0
 		failedCount := 0
+		var msgMu sync.Mutex // protects processedCount and failedCount
 		for i := range resp.Messages {
 			msg := &resp.Messages[i]
 			if msg.MessageType != MessageTypeUser {
@@ -152,18 +156,26 @@ func (p *Poller) Run(ctx context.Context) error {
 			}
 
 			p.wg.Add(1)
-			if err := p.handler(internalCtx, msg); err != nil {
-				p.logger.Error("handler error",
-					"error", err,
-					"from_user_id", msg.FromUserID,
-				)
-				failedCount++
-				// Continue processing other messages even if one fails
-			} else {
-				processedCount++
-			}
-			p.wg.Done()
+			go func(msg *Message) {
+				defer p.wg.Done()
+				if err := p.handler(internalCtx, msg); err != nil {
+					p.logger.Error("handler error",
+						"error", err,
+						"from_user_id", msg.FromUserID,
+					)
+					msgMu.Lock()
+					failedCount++
+					msgMu.Unlock()
+				} else {
+					msgMu.Lock()
+					processedCount++
+					msgMu.Unlock()
+				}
+			}(msg)
 		}
+
+		// Wait for all messages in this batch to complete before updating cursor
+		p.wg.Wait()
 
 		p.logger.Debug("messages processed",
 			"processed", processedCount,
