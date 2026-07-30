@@ -209,9 +209,9 @@ func TestStreamingDownloadAPIContract(t *testing.T) {
 
 	// Compile-time signature checks for the Bot streaming methods.
 	var (
-		_ func(ctx context.Context, cdnBaseURL string, img *ImageItem, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadImageFromItemTo
+		_ func(ctx context.Context, cdnBaseURL string, img *ImageItem, w io.Writer, opts DownloadOptions) (int64, error)   = (*Bot)(nil).DownloadImageFromItemTo
 		_ func(ctx context.Context, voice *VoiceItem, cdnBaseURL string, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadVoiceTo
-		_ func(ctx context.Context, file *FileItem, cdnBaseURL string, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadFileFromItemTo
+		_ func(ctx context.Context, file *FileItem, cdnBaseURL string, w io.Writer, opts DownloadOptions) (int64, error)   = (*Bot)(nil).DownloadFileFromItemTo
 		_ func(ctx context.Context, video *VideoItem, cdnBaseURL string, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadVideoFromItemTo
 	)
 
