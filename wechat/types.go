@@ -135,6 +135,14 @@ type UploadURLRequest = media.UploadURLRequest
 // UploadURLResponse is the response from POST /ilink/bot/getuploadurl.
 type UploadURLResponse = media.UploadURLResponse
 
+// DownloadOptions controls streaming download behavior.
+// MaxSize is the maximum number of ciphertext bytes to accept; 0 means no limit.
+type DownloadOptions = media.DownloadOptions
+
+// ErrMaxSizeExceeded is returned when a streaming download exceeds
+// DownloadOptions.MaxSize. Use errors.Is to detect it.
+var ErrMaxSizeExceeded = media.ErrMaxSizeExceeded
+
 // --- Text utilities ---
 
 // SplitText splits a long text into multiple chunks that fit within the message limit.

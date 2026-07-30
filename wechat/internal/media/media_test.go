@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -415,5 +417,319 @@ func TestIsHexString(t *testing.T) {
 				t.Errorf("isHexString(%q) = %v, want %v", tt.s, got, tt.want)
 			}
 		})
+	}
+}
+
+// --- Streaming download (DownloadToWriter) tests ---
+
+// newTestManager returns a MediaManager wired to a mock API client.
+func newTestManager() *MediaManager {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	return NewMediaManager(&mockAPIClient{}, &http.Client{}, logger)
+}
+
+// makeStreamFixture encrypts size bytes of deterministic plaintext and returns
+// (plaintext, ciphertext, base64 key string).
+func makeStreamFixture(t *testing.T, size int) ([]byte, []byte, string) {
+	t.Helper()
+	plaintext := make([]byte, size)
+	for i := range plaintext {
+		plaintext[i] = byte(i % 251)
+	}
+	aesKey := bytes.Repeat([]byte{0x42}, 16)
+	encrypted, err := crypto.EncryptAESECB(plaintext, aesKey)
+	if err != nil {
+		t.Fatalf("encrypt fixture error = %v", err)
+	}
+	return plaintext, encrypted, base64.StdEncoding.EncodeToString(aesKey)
+}
+
+func TestDownloadToWriter_Basic(t *testing.T) {
+	plaintext, encrypted, keyStr := makeStreamFixture(t, 100000)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(encrypted)
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+	var buf bytes.Buffer
+	n, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf, DownloadOptions{})
+	if err != nil {
+		t.Fatalf("DownloadToWriter() error = %v", err)
+	}
+	if n != int64(len(plaintext)) {
+		t.Errorf("DownloadToWriter() n = %d, want %d", n, len(plaintext))
+	}
+	if !bytes.Equal(buf.Bytes(), plaintext) {
+		t.Error("DownloadToWriter() output differs from plaintext")
+	}
+}
+
+func TestDownloadToWriter_HexEncodedKey(t *testing.T) {
+	// Key given as base64(32 hex chars), same format as DownloadFileWithKey supports.
+	plaintext := []byte("hex key format plaintext")
+	aesKey := bytes.Repeat([]byte{0x24}, 16)
+	encrypted, err := crypto.EncryptAESECB(plaintext, aesKey)
+	if err != nil {
+		t.Fatalf("encrypt fixture error = %v", err)
+	}
+	keyStr := base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(aesKey)))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(encrypted)
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+	var buf bytes.Buffer
+	if _, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf, DownloadOptions{}); err != nil {
+		t.Fatalf("DownloadToWriter() error = %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), plaintext) {
+		t.Error("DownloadToWriter() output differs from plaintext")
+	}
+}
+
+func TestDownloadToWriter_MaxSizeBoundary(t *testing.T) {
+	plaintext, encrypted, keyStr := makeStreamFixture(t, 1000)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(encrypted)
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+
+	// MaxSize exactly equal to the ciphertext size must pass.
+	var buf bytes.Buffer
+	n, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf,
+		DownloadOptions{MaxSize: int64(len(encrypted))})
+	if err != nil {
+		t.Fatalf("MaxSize == ciphertext size: unexpected error = %v", err)
+	}
+	if n != int64(len(plaintext)) || !bytes.Equal(buf.Bytes(), plaintext) {
+		t.Error("MaxSize == ciphertext size: output mismatch")
+	}
+
+	// One byte less must be rejected with ErrMaxSizeExceeded.
+	buf.Reset()
+	_, err = manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf,
+		DownloadOptions{MaxSize: int64(len(encrypted)) - 1})
+	if !errors.Is(err, ErrMaxSizeExceeded) {
+		t.Fatalf("MaxSize == ciphertext size - 1: error = %v, want ErrMaxSizeExceeded", err)
+	}
+}
+
+func TestDownloadToWriter_ContentLengthGate(t *testing.T) {
+	// The server declares an oversized Content-Length; the client must reject
+	// via the header check without decrypting any body bytes.
+	_, encrypted, keyStr := makeStreamFixture(t, 100000)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(encrypted)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(encrypted)
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+	var buf bytes.Buffer
+	n, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf,
+		DownloadOptions{MaxSize: 16})
+	if !errors.Is(err, ErrMaxSizeExceeded) {
+		t.Fatalf("error = %v, want ErrMaxSizeExceeded", err)
+	}
+	if n != 0 {
+		t.Errorf("n = %d, want 0 (body must not be decrypted)", n)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("writer received %d bytes, want 0 (Content-Length gate must fire before reading body)", buf.Len())
+	}
+}
+
+func TestDownloadToWriter_ChunkedStreamTruncated(t *testing.T) {
+	// No Content-Length (chunked transfer): the in-flight ciphertext counter
+	// must abort the download mid-stream once MaxSize is exceeded, and the
+	// writer must have received a partial (incomplete) output.
+	plaintext, encrypted, keyStr := makeStreamFixture(t, 256*1024)
+	maxSize := int64(100 * 1024)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("response writer does not support flushing")
+			return
+		}
+		// Stream in small chunks and flush to force chunked encoding.
+		for off := 0; off < len(encrypted); off += 8 * 1024 {
+			end := off + 8*1024
+			if end > len(encrypted) {
+				end = len(encrypted)
+			}
+			if _, err := w.Write(encrypted[off:end]); err != nil {
+				return // client aborted, expected
+			}
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+	var buf bytes.Buffer
+	n, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf,
+		DownloadOptions{MaxSize: maxSize})
+	if !errors.Is(err, ErrMaxSizeExceeded) {
+		t.Fatalf("error = %v, want ErrMaxSizeExceeded", err)
+	}
+	// Contract: on error the writer may hold a partial, incomplete output.
+	if n != int64(buf.Len()) {
+		t.Errorf("returned n = %d, but writer holds %d bytes", n, buf.Len())
+	}
+	if buf.Len() >= len(plaintext) {
+		t.Errorf("writer received %d bytes, want a truncated output (< %d)", buf.Len(), len(plaintext))
+	}
+	if buf.Len() > 0 && !bytes.Equal(buf.Bytes(), plaintext[:buf.Len()]) {
+		t.Error("partial output is not a prefix of the plaintext")
+	}
+}
+
+func TestDownloadToWriter_MisreportedContentLength(t *testing.T) {
+	// The server hides the real size (identity framing, no Content-Length,
+	// Connection: close), so the header gate cannot fire; the byte counter
+	// must still enforce MaxSize.
+	_, encrypted, keyStr := makeStreamFixture(t, 64*1024)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("response writer does not support hijacking")
+			return
+		}
+		conn, bw, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack error: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = bw.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
+		_, _ = bw.Write(encrypted)
+		_ = bw.Flush()
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+	var buf bytes.Buffer
+	_, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf,
+		DownloadOptions{MaxSize: 1024})
+	if !errors.Is(err, ErrMaxSizeExceeded) {
+		t.Fatalf("error = %v, want ErrMaxSizeExceeded", err)
+	}
+}
+
+func TestDownloadToWriter_MatchesDownloadFileWithKey(t *testing.T) {
+	// The streaming API must produce byte-identical output to the legacy
+	// []byte API against the same fake CDN.
+	for _, size := range []int{0, 1, 15, 16, 17, 1000, 32 * 1024, 100000} {
+		_, encrypted, keyStr := makeStreamFixture(t, size)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(encrypted)
+		}))
+
+		manager := newTestManager()
+
+		legacy, err := manager.DownloadFileWithKey(context.Background(), server.URL, keyStr)
+		if err != nil {
+			server.Close()
+			t.Fatalf("size=%d: DownloadFileWithKey() error = %v", size, err)
+		}
+
+		var buf bytes.Buffer
+		n, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf, DownloadOptions{})
+		server.Close()
+		if err != nil {
+			t.Fatalf("size=%d: DownloadToWriter() error = %v", size, err)
+		}
+		if n != int64(len(legacy)) || !bytes.Equal(buf.Bytes(), legacy) {
+			t.Fatalf("size=%d: streaming output differs from legacy API", size)
+		}
+	}
+}
+
+func TestDownloadToWriter_HTTPErrorStatus(t *testing.T) {
+	_, _, keyStr := makeStreamFixture(t, 16)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("not found"))
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+	var buf bytes.Buffer
+	if _, err := manager.DownloadToWriter(context.Background(), server.URL, keyStr, &buf, DownloadOptions{}); err == nil {
+		t.Fatal("expected error for http 404, got nil")
+	}
+}
+
+func TestDownloadItemToVariants(t *testing.T) {
+	plaintext, encrypted, keyStr := makeStreamFixture(t, 5000)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(encrypted)
+	}))
+	defer server.Close()
+
+	manager := newTestManager()
+	cdnMedia := &model.CDNMedia{EncryptQueryParam: "test-param", AESKey: keyStr}
+
+	tests := []struct {
+		name string
+		call func(w io.Writer) (int64, error)
+	}{
+		{"image", func(w io.Writer) (int64, error) {
+			return manager.DownloadImageTo(context.Background(), server.URL, &model.ImageItem{Media: cdnMedia}, w, DownloadOptions{})
+		}},
+		{"voice", func(w io.Writer) (int64, error) {
+			return manager.DownloadVoiceTo(context.Background(), server.URL, &model.VoiceItem{Media: cdnMedia}, w, DownloadOptions{})
+		}},
+		{"file", func(w io.Writer) (int64, error) {
+			return manager.DownloadFileItemTo(context.Background(), server.URL, &model.FileItem{Media: cdnMedia}, w, DownloadOptions{})
+		}},
+		{"video", func(w io.Writer) (int64, error) {
+			return manager.DownloadVideoItemTo(context.Background(), server.URL, &model.VideoItem{Media: cdnMedia}, w, DownloadOptions{})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			n, err := tt.call(&buf)
+			if err != nil {
+				t.Fatalf("Download%sTo error = %v", tt.name, err)
+			}
+			if n != int64(len(plaintext)) || !bytes.Equal(buf.Bytes(), plaintext) {
+				t.Errorf("Download%sTo output mismatch", tt.name)
+			}
+		})
+	}
+}
+
+func TestDownloadItemToVariants_NoMedia(t *testing.T) {
+	manager := newTestManager()
+	var buf bytes.Buffer
+	ctx := context.Background()
+
+	if _, err := manager.DownloadImageTo(ctx, "http://x", &model.ImageItem{}, &buf, DownloadOptions{}); err == nil {
+		t.Error("DownloadImageTo: expected error for missing media")
+	}
+	if _, err := manager.DownloadVoiceTo(ctx, "http://x", &model.VoiceItem{}, &buf, DownloadOptions{}); err == nil {
+		t.Error("DownloadVoiceTo: expected error for missing media")
+	}
+	if _, err := manager.DownloadFileItemTo(ctx, "http://x", &model.FileItem{}, &buf, DownloadOptions{}); err == nil {
+		t.Error("DownloadFileItemTo: expected error for missing media")
+	}
+	if _, err := manager.DownloadVideoItemTo(ctx, "http://x", &model.VideoItem{}, &buf, DownloadOptions{}); err == nil {
+		t.Error("DownloadVideoItemTo: expected error for missing media")
 	}
 }

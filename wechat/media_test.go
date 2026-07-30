@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -188,5 +189,40 @@ func TestBuildFileItem_PublicAPI(t *testing.T) {
 	}
 	if item.FileItem.Length != "98765" {
 		t.Errorf("Length = %s, want 98765", item.FileItem.Length)
+	}
+}
+
+// TestStreamingDownloadAPIContract locks the exported streaming download API
+// at compile time: the aliases, the sentinel error and the exact signatures of
+// the four Bot streaming download methods.
+func TestStreamingDownloadAPIContract(t *testing.T) {
+	// DownloadOptions is an alias of the internal media type with a MaxSize field.
+	var opts DownloadOptions = media.DownloadOptions{MaxSize: 1}
+	if opts.MaxSize != 1 {
+		t.Error("DownloadOptions.MaxSize not settable")
+	}
+
+	// ErrMaxSizeExceeded is the internal sentinel, detectable via errors.Is.
+	if !errors.Is(ErrMaxSizeExceeded, media.ErrMaxSizeExceeded) {
+		t.Error("ErrMaxSizeExceeded does not match media.ErrMaxSizeExceeded")
+	}
+
+	// Compile-time signature checks for the Bot streaming methods.
+	var (
+		_ func(ctx context.Context, cdnBaseURL string, img *ImageItem, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadImageFromItemTo
+		_ func(ctx context.Context, voice *VoiceItem, cdnBaseURL string, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadVoiceTo
+		_ func(ctx context.Context, file *FileItem, cdnBaseURL string, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadFileFromItemTo
+		_ func(ctx context.Context, video *VideoItem, cdnBaseURL string, w io.Writer, opts DownloadOptions) (int64, error) = (*Bot)(nil).DownloadVideoFromItemTo
+	)
+
+	// DeclaredSize accessors must be callable through the alias types.
+	var (
+		_ func() int64 = (&FileItem{}).DeclaredSize
+		_ func() int64 = (&VoiceItem{}).DeclaredSize
+		_ func() int64 = (&VideoItem{}).DeclaredSize
+		_ func() int64 = (&ImageItem{}).DeclaredSize
+	)
+	if got := (&FileItem{Length: "42"}).DeclaredSize(); got != 42 {
+		t.Errorf("(*FileItem).DeclaredSize() via alias = %d, want 42", got)
 	}
 }

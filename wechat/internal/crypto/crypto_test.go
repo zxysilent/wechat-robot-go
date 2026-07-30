@@ -3,7 +3,11 @@ package crypto_test
 import (
 	"bytes"
 	"crypto/aes"
+	crand "crypto/rand"
+	"io"
+	mrand "math/rand"
 	"testing"
+	"testing/iotest"
 
 	"github.com/SpellingDragon/wechat-robot-go/wechat/internal/crypto"
 )
@@ -285,5 +289,131 @@ func TestDecryptAESECB_WrongKey(t *testing.T) {
 	decrypted, err := crypto.DecryptAESECB(ciphertext, key2)
 	if err == nil && bytes.Equal(decrypted, plaintext) {
 		t.Error("Decryption with wrong key should not produce original plaintext")
+	}
+}
+
+// --- NewECBDecryptReader tests ---
+
+func decryptViaReader(t *testing.T, src io.Reader, key []byte) ([]byte, error) {
+	t.Helper()
+	return io.ReadAll(crypto.NewECBDecryptReader(src, key))
+}
+
+func TestNewECBDecryptReader_EmptyCiphertext(t *testing.T) {
+	key := bytes.Repeat([]byte{0x11}, 16)
+	_, err := decryptViaReader(t, bytes.NewReader(nil), key)
+	if err == nil {
+		t.Fatal("NewECBDecryptReader with empty ciphertext: expected error, got nil")
+	}
+}
+
+func TestNewECBDecryptReader_InvalidKeyLength(t *testing.T) {
+	ciphertext := bytes.Repeat([]byte{0x22}, 16)
+	for _, keyLen := range []int{0, 15, 17, 32} {
+		_, err := decryptViaReader(t, bytes.NewReader(ciphertext), bytes.Repeat([]byte{0x01}, keyLen))
+		if err == nil {
+			t.Errorf("key length %d: expected error, got nil", keyLen)
+		}
+	}
+}
+
+func TestNewECBDecryptReader_NonBlockAlignedCiphertext(t *testing.T) {
+	key := bytes.Repeat([]byte{0x33}, 16)
+	for _, n := range []int{1, 15, 17, 31, 33} {
+		_, err := decryptViaReader(t, bytes.NewReader(bytes.Repeat([]byte{0x44}, n)), key)
+		if err == nil {
+			t.Errorf("ciphertext length %d: expected error, got nil", n)
+		}
+	}
+}
+
+func TestNewECBDecryptReader_InvalidPadding(t *testing.T) {
+	key := bytes.Repeat([]byte{0x55}, 16)
+	plaintext := []byte("some plaintext data")
+	ciphertext, err := crypto.EncryptAESECB(plaintext, key)
+	if err != nil {
+		t.Fatalf("EncryptAESECB() error = %v", err)
+	}
+	// Corrupt the last ciphertext block so padding is invalid after decryption.
+	corrupted := append([]byte(nil), ciphertext...)
+	corrupted[len(corrupted)-1] ^= 0xFF
+	if _, err := decryptViaReader(t, bytes.NewReader(corrupted), key); err == nil {
+		t.Fatal("expected invalid padding error, got nil")
+	}
+}
+
+func TestNewECBDecryptReader_MatchesDecryptAESECB(t *testing.T) {
+	key, err := crypto.GenerateAESKey()
+	if err != nil {
+		t.Fatalf("GenerateAESKey() error = %v", err)
+	}
+
+	// Cover empty, single block, block boundary +/- 1, chunk boundary and
+	// assorted random lengths.
+	lengths := []int{0, 1, 15, 16, 17, 31, 32, 33, 255, 4096, 32*1024 - 1, 32 * 1024, 32*1024 + 1, 100000}
+	for i := 0; i < 20; i++ {
+		lengths = append(lengths, mrand.Intn(200000))
+	}
+
+	for _, n := range lengths {
+		plaintext := make([]byte, n)
+		if _, err := crand.Read(plaintext); err != nil {
+			t.Fatalf("rand.Read() error = %v", err)
+		}
+		ciphertext, err := crypto.EncryptAESECB(plaintext, key)
+		if err != nil {
+			t.Fatalf("len=%d: EncryptAESECB() error = %v", n, err)
+		}
+
+		want, err := crypto.DecryptAESECB(ciphertext, key)
+		if err != nil {
+			t.Fatalf("len=%d: DecryptAESECB() error = %v", n, err)
+		}
+		got, err := decryptViaReader(t, bytes.NewReader(ciphertext), key)
+		if err != nil {
+			t.Fatalf("len=%d: NewECBDecryptReader error = %v", n, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("len=%d: streaming output differs from DecryptAESECB", n)
+		}
+	}
+}
+
+func TestNewECBDecryptReader_OneByteAtATimeSource(t *testing.T) {
+	key := bytes.Repeat([]byte{0x66}, 16)
+	plaintext := make([]byte, 1000)
+	if _, err := crand.Read(plaintext); err != nil {
+		t.Fatalf("rand.Read() error = %v", err)
+	}
+	ciphertext, err := crypto.EncryptAESECB(plaintext, key)
+	if err != nil {
+		t.Fatalf("EncryptAESECB() error = %v", err)
+	}
+
+	got, err := decryptViaReader(t, iotest.OneByteReader(bytes.NewReader(ciphertext)), key)
+	if err != nil {
+		t.Fatalf("NewECBDecryptReader with one-byte source error = %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatal("one-byte source: streaming output differs from original plaintext")
+	}
+}
+
+func TestNewECBDecryptReader_SingleBlock(t *testing.T) {
+	key := bytes.Repeat([]byte{0x77}, 16)
+	plaintext := []byte("short") // pads into exactly one block
+	ciphertext, err := crypto.EncryptAESECB(plaintext, key)
+	if err != nil {
+		t.Fatalf("EncryptAESECB() error = %v", err)
+	}
+	if len(ciphertext) != aes.BlockSize {
+		t.Fatalf("expected single-block ciphertext, got %d bytes", len(ciphertext))
+	}
+	got, err := decryptViaReader(t, bytes.NewReader(ciphertext), key)
+	if err != nil {
+		t.Fatalf("NewECBDecryptReader error = %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("got %q, want %q", got, plaintext)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -241,18 +242,22 @@ func (m *MediaManager) DownloadFile(ctx context.Context, url string, aesKeyHex s
 	return m.DownloadFileWithKey(ctx, url, aesKeyHex)
 }
 
-// DownloadFileWithKey downloads and decrypts a media file using the provided AES key.
+// DownloadOptions controls streaming download behavior.
+type DownloadOptions struct {
+	// MaxSize is the maximum number of ciphertext bytes to accept.
+	// 0 means no limit.
+	MaxSize int64
+}
+
+// ErrMaxSizeExceeded is returned when a download exceeds DownloadOptions.MaxSize.
+// Use errors.Is to detect it.
+var ErrMaxSizeExceeded = errors.New("media: max download size exceeded")
+
+// normalizeAESKey decodes an AES key string into 16 raw key bytes.
 // The aesKeyStr is expected to be base64-encoded and can be:
 //   - base64(16 raw bytes) → direct AES key
 //   - base64(32 hex chars) → hex string that needs to be parsed as hex
-func (m *MediaManager) DownloadFileWithKey(ctx context.Context, url string, aesKeyStr string) ([]byte, error) {
-	// Download encrypted file
-	encrypted, err := m.downloadFromCDN(ctx, url)
-	if err != nil {
-		return nil, fmt.Errorf("download from CDN: %w", err)
-	}
-
-	// Decode AES key from base64
+func normalizeAESKey(aesKeyStr string) ([]byte, error) {
 	decoded, err := base64.StdEncoding.DecodeString(aesKeyStr)
 	if err != nil {
 		return nil, fmt.Errorf("decode base64 AES key: %w", err)
@@ -276,14 +281,88 @@ func (m *MediaManager) DownloadFileWithKey(ctx context.Context, url string, aesK
 	if len(aesKeyBytes) != 16 {
 		return nil, fmt.Errorf("AES key must be 16 bytes, got %d", len(aesKeyBytes))
 	}
+	return aesKeyBytes, nil
+}
 
-	// Decrypt file content
-	plaintext, err := crypto.DecryptAESECB(encrypted, aesKeyBytes)
+// maxSizeReader counts ciphertext bytes read from the underlying reader and
+// fails with ErrMaxSizeExceeded once the cumulative total exceeds max.
+// max <= 0 disables the limit.
+type maxSizeReader struct {
+	r     io.Reader
+	max   int64
+	total int64
+}
+
+func (l *maxSizeReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	l.total += int64(n)
+	if l.max > 0 && l.total > l.max {
+		return n, ErrMaxSizeExceeded
+	}
+	return n, err
+}
+
+// DownloadToWriter downloads a media file from CDN, decrypts it on the fly and
+// writes the plaintext to w using constant memory. It returns the number of
+// plaintext bytes written to w.
+//
+// If opts.MaxSize > 0, the download is rejected with ErrMaxSizeExceeded when
+// the ciphertext exceeds MaxSize — either up front via Content-Length (before
+// reading the body), or mid-stream via a counting reader (which also covers
+// chunked responses without Content-Length and misreported lengths).
+//
+// On error, w may already have received a partial, incomplete output; the
+// caller is responsible for discarding it.
+func (m *MediaManager) DownloadToWriter(ctx context.Context, url, aesKeyStr string, w io.Writer, opts DownloadOptions) (int64, error) {
+	aesKeyBytes, err := normalizeAESKey(aesKeyStr)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt file: %w", err)
+		return 0, err
 	}
 
-	return plaintext, nil
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("download failed: http %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Reject oversized downloads up front without reading the body.
+	if resp.ContentLength > 0 && opts.MaxSize > 0 && resp.ContentLength > opts.MaxSize {
+		return 0, fmt.Errorf("declared content length %d exceeds max size %d: %w",
+			resp.ContentLength, opts.MaxSize, ErrMaxSizeExceeded)
+	}
+
+	// Enforce MaxSize on actually-read ciphertext bytes as a fallback for
+	// chunked responses and misreported Content-Length.
+	counted := &maxSizeReader{r: resp.Body, max: opts.MaxSize}
+	decrypter := crypto.NewECBDecryptReader(counted, aesKeyBytes)
+
+	n, err := io.Copy(w, decrypter)
+	if err != nil {
+		return n, fmt.Errorf("download and decrypt: %w", err)
+	}
+	return n, nil
+}
+
+// DownloadFileWithKey downloads and decrypts a media file using the provided AES key.
+// The aesKeyStr is expected to be base64-encoded and can be:
+//   - base64(16 raw bytes) → direct AES key
+//   - base64(32 hex chars) → hex string that needs to be parsed as hex
+func (m *MediaManager) DownloadFileWithKey(ctx context.Context, url string, aesKeyStr string) ([]byte, error) {
+	var buf bytes.Buffer
+	if _, err := m.DownloadToWriter(ctx, url, aesKeyStr, &buf, DownloadOptions{}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // isHexString checks if a string contains only hex characters.
@@ -296,86 +375,113 @@ func isHexString(s string) bool {
 	return len(s) == 32
 }
 
-// DownloadImage downloads and decrypts an image from WeChat CDN.
-// It handles both hex-encoded and base64-encoded AES keys from ImageItem.
-func (m *MediaManager) DownloadImage(ctx context.Context, cdnBaseURL string, imageItem *model.ImageItem) ([]byte, error) {
-	// Build download URL
-	downloadURL := fmt.Sprintf("%s/download?encrypted_query_param=%s",
-		cdnBaseURL, url.QueryEscape(imageItem.Media.EncryptQueryParam))
+// buildDownloadURL constructs the CDN download URL for an encrypted query param.
+func buildDownloadURL(cdnBaseURL, encryptQueryParam string) string {
+	return fmt.Sprintf("%s/download?encrypted_query_param=%s",
+		cdnBaseURL, url.QueryEscape(encryptQueryParam))
+}
 
-	// Determine AES key source and decode
-	var aesKeyStr string
+// resolveImageDownload builds the download URL and AES key string for an ImageItem.
+// It handles both hex-encoded (ImageItem.AESKey) and base64-encoded (Media.AESKey) keys.
+func resolveImageDownload(cdnBaseURL string, imageItem *model.ImageItem) (downloadURL, aesKeyStr string, err error) {
+	if imageItem.Media == nil || imageItem.Media.EncryptQueryParam == "" {
+		return "", "", fmt.Errorf("image item has no media data")
+	}
+
 	if imageItem.AESKey != "" {
 		aesKeyBytes, _ := hex.DecodeString(imageItem.AESKey)
 		aesKeyStr = base64.StdEncoding.EncodeToString(aesKeyBytes)
-	} else if imageItem.Media != nil && imageItem.Media.AESKey != "" {
+	} else if imageItem.Media.AESKey != "" {
 		aesKeyStr = imageItem.Media.AESKey
 	} else {
-		return nil, fmt.Errorf("no AES key found in image item")
+		return "", "", fmt.Errorf("no AES key found in image item")
 	}
 
+	return buildDownloadURL(cdnBaseURL, imageItem.Media.EncryptQueryParam), aesKeyStr, nil
+}
+
+// resolveMediaDownload builds the download URL and AES key string for a plain
+// CDNMedia reference (voice/file/video). kind is used in error messages.
+func resolveMediaDownload(cdnBaseURL string, media *model.CDNMedia, kind string) (downloadURL, aesKeyStr string, err error) {
+	if media == nil || media.EncryptQueryParam == "" {
+		return "", "", fmt.Errorf("%s item has no media data", kind)
+	}
+	return buildDownloadURL(cdnBaseURL, media.EncryptQueryParam), media.AESKey, nil
+}
+
+// DownloadImage downloads and decrypts an image from WeChat CDN.
+// It handles both hex-encoded and base64-encoded AES keys from ImageItem.
+func (m *MediaManager) DownloadImage(ctx context.Context, cdnBaseURL string, imageItem *model.ImageItem) ([]byte, error) {
+	downloadURL, aesKeyStr, err := resolveImageDownload(cdnBaseURL, imageItem)
+	if err != nil {
+		return nil, err
+	}
 	return m.DownloadFileWithKey(ctx, downloadURL, aesKeyStr)
 }
 
-// downloadFromCDN downloads raw bytes from CDN.
-func (m *MediaManager) downloadFromCDN(ctx context.Context, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// DownloadImageTo streams a decrypted image from WeChat CDN into w.
+// It returns the number of plaintext bytes written to w.
+func (m *MediaManager) DownloadImageTo(ctx context.Context, cdnBaseURL string, imageItem *model.ImageItem, w io.Writer, opts DownloadOptions) (int64, error) {
+	downloadURL, aesKeyStr, err := resolveImageDownload(cdnBaseURL, imageItem)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return 0, err
 	}
-
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("download file: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("download failed: http %d: %s", resp.StatusCode, string(body))
-	}
-
-	return io.ReadAll(resp.Body)
+	return m.DownloadToWriter(ctx, downloadURL, aesKeyStr, w, opts)
 }
 
 // DownloadVoice downloads and decrypts a voice message from a VoiceItem.
 func (m *MediaManager) DownloadVoice(ctx context.Context, cdnBaseURL string, voiceItem *model.VoiceItem) ([]byte, error) {
-	if voiceItem.Media == nil || voiceItem.Media.EncryptQueryParam == "" {
-		return nil, fmt.Errorf("voice item has no media data")
+	downloadURL, aesKeyStr, err := resolveMediaDownload(cdnBaseURL, voiceItem.Media, "voice")
+	if err != nil {
+		return nil, err
 	}
+	return m.DownloadFileWithKey(ctx, downloadURL, aesKeyStr)
+}
 
-	// Build download URL
-	downloadURL := fmt.Sprintf("%s/download?encrypted_query_param=%s",
-		cdnBaseURL, url.QueryEscape(voiceItem.Media.EncryptQueryParam))
-
-	// Download and decrypt
-	return m.DownloadFileWithKey(ctx, downloadURL, voiceItem.Media.AESKey)
+// DownloadVoiceTo streams a decrypted voice message from a VoiceItem into w.
+// It returns the number of plaintext bytes written to w.
+func (m *MediaManager) DownloadVoiceTo(ctx context.Context, cdnBaseURL string, voiceItem *model.VoiceItem, w io.Writer, opts DownloadOptions) (int64, error) {
+	downloadURL, aesKeyStr, err := resolveMediaDownload(cdnBaseURL, voiceItem.Media, "voice")
+	if err != nil {
+		return 0, err
+	}
+	return m.DownloadToWriter(ctx, downloadURL, aesKeyStr, w, opts)
 }
 
 // DownloadFileItem downloads and decrypts a file from a FileItem.
 func (m *MediaManager) DownloadFileItem(ctx context.Context, cdnBaseURL string, fileItem *model.FileItem) ([]byte, error) {
-	if fileItem.Media == nil || fileItem.Media.EncryptQueryParam == "" {
-		return nil, fmt.Errorf("file item has no media data")
+	downloadURL, aesKeyStr, err := resolveMediaDownload(cdnBaseURL, fileItem.Media, "file")
+	if err != nil {
+		return nil, err
 	}
+	return m.DownloadFileWithKey(ctx, downloadURL, aesKeyStr)
+}
 
-	// Build download URL
-	downloadURL := fmt.Sprintf("%s/download?encrypted_query_param=%s",
-		cdnBaseURL, url.QueryEscape(fileItem.Media.EncryptQueryParam))
-
-	// Download and decrypt
-	return m.DownloadFileWithKey(ctx, downloadURL, fileItem.Media.AESKey)
+// DownloadFileItemTo streams a decrypted file from a FileItem into w.
+// It returns the number of plaintext bytes written to w.
+func (m *MediaManager) DownloadFileItemTo(ctx context.Context, cdnBaseURL string, fileItem *model.FileItem, w io.Writer, opts DownloadOptions) (int64, error) {
+	downloadURL, aesKeyStr, err := resolveMediaDownload(cdnBaseURL, fileItem.Media, "file")
+	if err != nil {
+		return 0, err
+	}
+	return m.DownloadToWriter(ctx, downloadURL, aesKeyStr, w, opts)
 }
 
 // DownloadVideoItem downloads and decrypts a video from a VideoItem.
 func (m *MediaManager) DownloadVideoItem(ctx context.Context, cdnBaseURL string, videoItem *model.VideoItem) ([]byte, error) {
-	if videoItem.Media == nil || videoItem.Media.EncryptQueryParam == "" {
-		return nil, fmt.Errorf("video item has no media data")
+	downloadURL, aesKeyStr, err := resolveMediaDownload(cdnBaseURL, videoItem.Media, "video")
+	if err != nil {
+		return nil, err
 	}
+	return m.DownloadFileWithKey(ctx, downloadURL, aesKeyStr)
+}
 
-	// Build download URL
-	downloadURL := fmt.Sprintf("%s/download?encrypted_query_param=%s",
-		cdnBaseURL, url.QueryEscape(videoItem.Media.EncryptQueryParam))
-
-	// Download and decrypt
-	return m.DownloadFileWithKey(ctx, downloadURL, videoItem.Media.AESKey)
+// DownloadVideoItemTo streams a decrypted video from a VideoItem into w.
+// It returns the number of plaintext bytes written to w.
+func (m *MediaManager) DownloadVideoItemTo(ctx context.Context, cdnBaseURL string, videoItem *model.VideoItem, w io.Writer, opts DownloadOptions) (int64, error) {
+	downloadURL, aesKeyStr, err := resolveMediaDownload(cdnBaseURL, videoItem.Media, "video")
+	if err != nil {
+		return 0, err
+	}
+	return m.DownloadToWriter(ctx, downloadURL, aesKeyStr, w, opts)
 }

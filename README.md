@@ -378,3 +378,66 @@ bot.SendVoiceFromPath(ctx, userID, "/path/to/voice.silk", 5000)
 // 视频
 bot.SendVideoFromPath(ctx, userID, "/path/to/video.mp4")
 ```
+
+## 流式媒体下载
+
+`Download*FromItemTo` / `DownloadVoiceTo` 系列方法以**常数内存**下载并解密媒体文件：密文边下载边解密，直接写入调用方提供的 `io.Writer`，不再把整个文件读入内存。
+
+```go
+// 下载文件到磁盘，并限制密文最大 100 MB
+f, err := os.Create("/path/to/output.pdf")
+if err != nil {
+    return err
+}
+defer f.Close()
+
+n, err := bot.DownloadFileFromItemTo(ctx, fileItem, cdnBaseURL, f,
+    wechat.DownloadOptions{MaxSize: 100 << 20})
+if err != nil {
+    if errors.Is(err, wechat.ErrMaxSizeExceeded) {
+        // 文件超过大小限制
+    }
+    // 契约：错误返回时 Writer 已收到的输出是不完整的，由调用方负责清理
+    f.Close()
+    os.Remove("/path/to/output.pdf")
+    return err
+}
+// n 为写入 Writer 的明文字节数
+```
+
+四个流式方法与既有 `[]byte` 方法一一镜像：
+
+| 既有方法 | 流式变体 |
+|---|---|
+| `DownloadImageFromItem` | `DownloadImageFromItemTo(ctx, cdnBaseURL, img, w, opts)` |
+| `DownloadVoice` | `DownloadVoiceTo(ctx, voice, cdnBaseURL, w, opts)` |
+| `DownloadFileFromItem` | `DownloadFileFromItemTo(ctx, file, cdnBaseURL, w, opts)` |
+| `DownloadVideoFromItem` | `DownloadVideoFromItemTo(ctx, video, cdnBaseURL, w, opts)` |
+
+### MaxSize 语义
+
+- `DownloadOptions.MaxSize` 限制的是**密文**字节数，`0` 表示不限制。
+- 若响应携带 `Content-Length` 且超限，将在**读取 body 之前**立即返回 `ErrMaxSizeExceeded`。
+- 对于 chunked 无长度或谎报长度的响应，下载过程中密文累计超限时同样返回 `ErrMaxSizeExceeded`（流中截断）。
+- 用 `errors.Is(err, wechat.ErrMaxSizeExceeded)` 判定。
+
+### 错误时的输出契约
+
+**错误返回时（包括 `ErrMaxSizeExceeded`），Writer 可能已经收到部分明文，该输出是不完整的，由调用方负责清理**（如删除半成品文件）。返回值 `int64` 始终等于已写入 Writer 的明文字节数。
+
+### 声明大小
+
+各媒体 Item 提供 `DeclaredSize() int64` 归一访问器，返回消息中声明的明文大小（字节），`0` 表示未知/缺失，可用于预先设定 `MaxSize` 或跳过超大文件：
+
+```go
+if size := fileItem.DeclaredSize(); size > 0 && size > 100<<20 {
+    // 声明大小超过 100 MB，直接跳过
+}
+```
+
+- `FileItem.DeclaredSize()`：解析 `Length` 字符串，空/非法返回 0
+- `VoiceItem.DeclaredSize()`：`FileSize`
+- `VideoItem.DeclaredSize()`：`VideoSize`
+- `ImageItem.DeclaredSize()`：`HDSize` 优先，为 0 时退回 `MidSize`
+
+注意：声明大小来自消息元数据，仅供参考，不参与 `MaxSize` 强制（强制以实际密文字节数为准）。

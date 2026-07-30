@@ -1,6 +1,9 @@
 package model
 
-import "context"
+import (
+	"context"
+	"strconv"
+)
 
 // MessageHandler is the callback type for handling incoming messages.
 type MessageHandler func(ctx context.Context, msg *Message) error
@@ -185,6 +188,47 @@ type VideoItem struct {
 	ThumbSize   int       `json:"thumb_size,omitempty"`
 	ThumbWidth  int       `json:"thumb_width,omitempty"`
 	ThumbHeight int       `json:"thumb_height,omitempty"`
+}
+
+// DeclaredSize returns the declared size of the file in bytes, parsed from
+// the Length field. It returns 0 when the size is unknown, missing or invalid.
+func (f *FileItem) DeclaredSize() int64 {
+	n, err := strconv.ParseInt(f.Length, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// DeclaredSize returns the declared size of the voice file in bytes.
+// It returns 0 when the size is unknown or missing.
+func (v *VoiceItem) DeclaredSize() int64 {
+	if v.FileSize < 0 {
+		return 0
+	}
+	return int64(v.FileSize)
+}
+
+// DeclaredSize returns the declared size of the video in bytes.
+// It returns 0 when the size is unknown or missing.
+func (v *VideoItem) DeclaredSize() int64 {
+	if v.VideoSize < 0 {
+		return 0
+	}
+	return int64(v.VideoSize)
+}
+
+// DeclaredSize returns the declared size of the image in bytes, preferring
+// HDSize and falling back to MidSize. It returns 0 when the size is unknown
+// or missing.
+func (i *ImageItem) DeclaredSize() int64 {
+	if i.HDSize > 0 {
+		return int64(i.HDSize)
+	}
+	if i.MidSize < 0 {
+		return 0
+	}
+	return int64(i.MidSize)
 }
 
 // --- API Request/Response types ---
